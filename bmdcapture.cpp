@@ -29,6 +29,13 @@
 #include <time.h>
 #include <signal.h>
 
+// File reading
+#include <iostream>
+#include <fstream>
+#include <string>
+#include <sstream>
+using namespace std;
+
 #include "compat.h"
 #include "DeckLinkAPI.h"
 #include "Capture.h"
@@ -49,7 +56,8 @@ IDeckLinkDisplayModeIterator *displayModeIterator;
 IDeckLinkDisplayMode *displayMode;
 IDeckLinkConfiguration *deckLinkConfiguration;
 
-static int g_videoModeIndex      = -1;
+static int camera      = 0;
+static int g_videoModeIndex      = 0;
 static int g_audioChannels       = 2;
 static int g_audioSampleDepth    = 16;
 const char *g_videoOutputFile    = NULL;
@@ -77,6 +85,68 @@ typedef struct AVPacketQueue {
 static AVPacketQueue queue;
 
 static AVPacket flush_pkt;
+
+
+template < typename T > std::string to_string( const T& n )
+    {
+        std::ostringstream stm ;
+        stm << n ;
+        return stm.str() ;
+    }
+
+
+HRESULT DeckLinkCaptureDelegate::VideoInputFormatChanged(BMDVideoInputFormatChangedEvents events, IDeckLinkDisplayMode *mode, BMDDetectedVideoInputFormatFlags formatFlags)
+{
+    // This only gets called if bmdVideoInputEnableFormatDetection was set
+    // when enabling video input
+    HRESULT result;
+    BMDDisplayMode selectedDisplayMode = mode->GetDisplayMode();
+    char*   displayModeName = NULL;
+    BMDPixelFormat  pixelFormat = bmdFormat10BitYUV;
+
+    if (formatFlags & bmdDetectedVideoInputRGB444)
+        pixelFormat = bmdFormat10BitRGB;
+
+    mode->GetName((const char**)&displayModeName);
+    printf("Video format changed to %s %s\n", displayModeName, formatFlags & bmdDetectedVideoInputRGB444 ? "RGB" : "YUV");
+
+    if (displayModeName)
+        free(displayModeName);
+
+    if (deckLinkInput)
+    {
+        deckLinkInput->StopStreams();
+
+        result = deckLinkInput->EnableVideoInput(selectedDisplayMode, pixelFormat, bmdVideoInputEnableFormatDetection);
+        if (result != S_OK)
+        {
+            fprintf(stderr, "Failed to switch video mode\n");
+            goto bail;
+        }
+
+        //deckLinkInput->StartStreams();
+        // Write datafile
+        ofstream myfile;
+        try {
+            string s = to_string(camera);
+            string smode = to_string(selectedDisplayMode);
+            myfile.open  ((s + ".input").c_str(), ios::out | ios::trunc);
+            if (myfile.is_open()) {
+                myfile << smode;
+                myfile.close();
+            }
+        } catch(int e) {
+            cout << "Error reading input file";
+        }
+
+        exit(0);
+
+    }
+
+bail:
+    return S_OK;
+    exit(0);
+}
 
 static void avpacket_queue_init(AVPacketQueue *q)
 {
@@ -526,12 +596,6 @@ HRESULT DeckLinkCaptureDelegate::VideoInputFrameArrived(
     return S_OK;
 }
 
-HRESULT DeckLinkCaptureDelegate::VideoInputFormatChanged(
-    BMDVideoInputFormatChangedEvents events, IDeckLinkDisplayMode *mode,
-    BMDDetectedVideoInputFormatFlags)
-{
-    return S_OK;
-}
 
 int usage(int status)
 {
@@ -655,9 +719,11 @@ int main(int argc, char *argv[])
     IDeckLinkIterator *deckLinkIterator = CreateDeckLinkIteratorInstance();
     DeckLinkCaptureDelegate *delegate;
     BMDDisplayMode selectedDisplayMode = bmdModeNTSC;
+    BMDDisplayMode tmpDisplayMode = bmdModeNTSC;
+    bool selectedMode = false;
     int displayModeCount               = 0;
     int exitStatus                     = 1;
-    int aconnection                    = 0, vconnection = 0, camera = 0, i = 0;
+    int aconnection                    = 0, vconnection = 0, i = 0;
     int ch;
     AVDictionary *opts = NULL;
     BMDPixelFormat pix = bmdFormat8BitYUV;
@@ -824,6 +890,7 @@ int main(int argc, char *argv[])
         goto bail;
     }
 
+
     result = S_OK;
     switch (aconnection) {
     case 1:
@@ -907,16 +974,46 @@ int main(int argc, char *argv[])
         usage(0);
     }
 
-    while (displayModeIterator->Next(&displayMode) == S_OK) {
-        if (g_videoModeIndex == displayModeCount) {
-            selectedDisplayMode = displayMode->GetDisplayMode();
-            break;
+
+    // Try and startup in the last auto-selected video mode
+    try {
+        string s = to_string(camera);
+        string line;
+        ifstream myfile ((s + ".input").c_str());
+        if (myfile.is_open()) {
+            getline (myfile,line);
+            myfile.close();
+            selectedDisplayMode = atoi(line.c_str());
+            selectedMode = true;
         }
-        displayModeCount++;
-        displayMode->Release();
+    } catch(int e) {
+        cout << "Error reading input file";
     }
 
-    result = deckLinkInput->EnableVideoInput(selectedDisplayMode, pix, 0);
+    // Fallback to the original mode selection
+    if (!selectedMode) {
+        while (displayModeIterator->Next(&displayMode) == S_OK) {
+            if (g_videoModeIndex == displayModeCount) {
+                selectedDisplayMode = displayMode->GetDisplayMode();
+                break;
+            }
+            displayModeCount++;
+            displayMode->Release();
+        }
+    } else {
+        // try and select the auto selected mode
+        while (displayModeIterator->Next(&displayMode) == S_OK) {
+            if (selectedDisplayMode == displayMode->GetDisplayMode()) {
+                break;
+            }
+            displayMode->Release();
+        }
+    }
+
+    cout << "display mode: " << selectedDisplayMode;
+    cout.flush();
+
+    result = deckLinkInput->EnableVideoInput(selectedDisplayMode, pix, bmdVideoInputEnableFormatDetection);
     if (result != S_OK) {
         fprintf(stderr,
                 "Failed to enable video input. Is another application using "
